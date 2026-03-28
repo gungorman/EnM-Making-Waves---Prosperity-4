@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp ./temp_tutorial/prices_round_0_day_-1.csv ./temp_tutorial/prices_round_0_day_-2.csv ./temp_tutorial/trades_round_0_day_-1.csv ./temp_tutorial/trades_round_0_day_-2.csv data/round_0_tutorial/)",
+      "Bash(rm -rf temp_tutorial)",
+      "Bash(pip install:*)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")"
+    ]
+  }
+}
