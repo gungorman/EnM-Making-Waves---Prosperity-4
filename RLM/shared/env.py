@@ -329,7 +329,7 @@ class TradingEnv(gym.Env):
             for col in ["bid_volume_1", "bid_volume_2", "bid_volume_3",
                         "ask_volume_1", "ask_volume_2", "ask_volume_3"]:
                 if col in df.columns:
-                    df[col] = (df[col] * scale).astype(int).clip(lower=1)
+                    df[col] = (df[col].fillna(0) * scale).astype(int).clip(lower=0)
 
             self.day_prices[product] = df
 
