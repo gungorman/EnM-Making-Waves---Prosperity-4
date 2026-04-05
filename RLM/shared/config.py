@@ -114,7 +114,9 @@ NETWORK_CONFIG = {
 # Environment config
 # =============================================================================
 ENV_CONFIG = {
-    "reward_inventory_penalty": 0.001,  # lambda for position^2 penalty
+    "reward_inventory_penalty": 0.02,   # lambda for position^2 penalty (per step)
+    "reward_terminal_penalty": 0.5,     # penalty per unit of open position at episode end
+    "reward_scale": 0.001,              # scale raw PnL to keep rewards in reasonable range
     "history_length": 200,              # ticks of price history to maintain
     "normalize_features": True,
     "clip_features": 3.0,              # clip z-scores at +/- this value

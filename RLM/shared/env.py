@@ -161,17 +161,27 @@ class TradingEnv(gym.Env):
 
         self.pnl = step_pnl + mtm_pnl
 
-        # Reward: PnL change minus inventory penalty
-        reward = (self.pnl - self.prev_pnl)
-        for product in self.products:
-            penalty = ENV_CONFIG["reward_inventory_penalty"] * self.positions[product] ** 2
-            reward -= penalty
-        self.prev_pnl = self.pnl
-
         # Advance step
         self.current_step += 1
         terminated = self.current_step >= len(self.timestamps)
         truncated = False
+
+        # Reward: scaled PnL change minus inventory penalty
+        scale = ENV_CONFIG.get("reward_scale", 0.001)
+        reward = (self.pnl - self.prev_pnl) * scale
+
+        # Quadratic inventory penalty (discourages holding large positions)
+        for product in self.products:
+            penalty = ENV_CONFIG["reward_inventory_penalty"] * (self.positions[product] / POSITION_LIMITS.get(product, 50)) ** 2
+            reward -= penalty
+
+        # Terminal penalty: punish open positions at end of day
+        if terminated:
+            for product in self.products:
+                terminal_cost = ENV_CONFIG.get("reward_terminal_penalty", 0.5) * abs(self.positions[product])
+                reward -= terminal_cost
+
+        self.prev_pnl = self.pnl
 
         obs = self._get_observation() if not terminated else np.zeros(
             self.observation_space.shape, dtype=np.float32
