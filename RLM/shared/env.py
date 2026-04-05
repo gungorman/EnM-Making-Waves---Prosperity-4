@@ -2,6 +2,9 @@
 Trading environment for RL training.
 Wraps historical CSV data into a Gymnasium-compatible environment.
 FinRL-inspired modular design.
+
+Performance: pre-indexes DataFrames at episode start so step() uses
+O(1) numpy lookups instead of DataFrame filtering.
 """
 
 import numpy as np
@@ -36,15 +39,6 @@ class TradingEnv(gym.Env):
         augment=False,
         seed=None,
     ):
-        """
-        Args:
-            prices_df: Full prices DataFrame (all days).
-            trades_df: Full trades DataFrame (all days).
-            products: List of products to trade. Defaults to config PRODUCTS.
-            day: Specific day to use. If None, randomly samples from available days.
-            augment: Whether to apply data augmentation.
-            seed: Random seed.
-        """
         super().__init__()
 
         self.prices_df = prices_df
@@ -57,7 +51,6 @@ class TradingEnv(gym.Env):
         self.num_products = len(self.products)
 
         # Action space: flattened discrete actions across products
-        # For 2 products with 9 actions each: Discrete(81)
         self.action_space = spaces.Discrete(NUM_ACTIONS ** self.num_products)
 
         # Observation space: features per product, concatenated
@@ -85,6 +78,10 @@ class TradingEnv(gym.Env):
         self.day_trades = {}
         self.timestamps = []
 
+        # Pre-indexed data (built in reset, used in step for speed)
+        self._price_rows = {}   # {product: list of row dicts}
+        self._trade_index = {}  # {product: {timestamp: [(price, qty), ...]}}
+
     def reset(self, seed=None, options=None):
         """Reset environment to start of a trading day."""
         if seed is not None:
@@ -110,12 +107,14 @@ class TradingEnv(gym.Env):
             if self.timestamps is None:
                 self.timestamps = dp["timestamp"].values
             else:
-                # Use intersection of timestamps across products
                 self.timestamps = np.intersect1d(self.timestamps, dp["timestamp"].values)
 
         # Apply augmentation
         if self.augment:
             self._apply_augmentation()
+
+        # === Pre-index for fast step() lookups ===
+        self._build_index()
 
         # Reset state
         self.current_step = 0
@@ -132,16 +131,27 @@ class TradingEnv(gym.Env):
 
         return obs, info
 
+    def _build_index(self):
+        """Pre-index price rows and trades by timestamp for O(1) lookups."""
+        ts_set = set(self.timestamps)
+
+        for product in self.products:
+            # Index price rows: filter to valid timestamps, store as list of dicts
+            df = self.day_prices[product]
+            df_filtered = df[df["timestamp"].isin(ts_set)].sort_values("timestamp")
+            self._price_rows[product] = df_filtered.to_dict("records")
+
+            # Index trades: group by timestamp
+            dt = self.day_trades[product]
+            trade_idx = {}
+            if len(dt) > 0:
+                dt_filtered = dt[dt["timestamp"].isin(ts_set)]
+                for ts, group in dt_filtered.groupby("timestamp"):
+                    trade_idx[ts] = list(zip(group["price"].values, group["quantity"].values))
+            self._trade_index[product] = trade_idx
+
     def step(self, action):
-        """Execute one timestep.
-
-        Args:
-            action: Integer in [0, NUM_ACTIONS^num_products).
-                    Decoded into per-product actions.
-
-        Returns:
-            (observation, reward, terminated, truncated, info)
-        """
+        """Execute one timestep."""
         # Decode flattened action into per-product actions
         product_actions = self._decode_action(action)
 
@@ -172,7 +182,8 @@ class TradingEnv(gym.Env):
 
         # Quadratic inventory penalty (discourages holding large positions)
         for product in self.products:
-            penalty = ENV_CONFIG["reward_inventory_penalty"] * (self.positions[product] / POSITION_LIMITS.get(product, 50)) ** 2
+            pos_ratio = self.positions[product] / POSITION_LIMITS.get(product, 50)
+            penalty = ENV_CONFIG["reward_inventory_penalty"] * pos_ratio ** 2
             reward -= penalty
 
         # Terminal penalty: punish open positions at end of day
@@ -196,7 +207,7 @@ class TradingEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def _get_observation(self):
-        """Compute feature vector for current timestep."""
+        """Compute feature vector for current timestep (uses pre-indexed data)."""
         all_features = []
 
         for product in self.products:
@@ -205,11 +216,9 @@ class TradingEnv(gym.Env):
                 all_features.append(np.zeros(NUM_FEATURES, dtype=np.float32))
                 continue
 
-            # Get trades at this timestamp
+            # Get trades at this timestamp from pre-built index
             ts = self.timestamps[self.current_step]
-            product_trades = self.day_trades[product]
-            ts_trades = product_trades[product_trades["timestamp"] == ts]
-            trades = list(zip(ts_trades["price"], ts_trades["quantity"])) if len(ts_trades) > 0 else None
+            trades = self._trade_index[product].get(ts, None)
 
             fc = self.feature_computers[product]
             features = compute_features_from_row(
@@ -227,17 +236,10 @@ class TradingEnv(gym.Env):
         return np.concatenate(all_features).astype(np.float32)
 
     def _get_price_row(self, product):
-        """Get the price row for a product at the current timestamp."""
-        if self.current_step >= len(self.timestamps):
+        """Get the price row for a product at current step (O(1) lookup)."""
+        if self.current_step >= len(self._price_rows.get(product, [])):
             return None
-
-        ts = self.timestamps[self.current_step]
-        df = self.day_prices[product]
-        rows = df[df["timestamp"] == ts]
-
-        if len(rows) == 0:
-            return None
-        return rows.iloc[0]
+        return self._price_rows[product][self.current_step]
 
     def _decode_action(self, action):
         """Decode flattened action int into per-product action list."""
@@ -271,14 +273,13 @@ class TradingEnv(gym.Env):
             # Market order: crosses the spread
             if side == "buy":
                 price = best_ask
-                # Clip quantity to respect position limit
                 max_buy = pos_limit - self.positions[product]
                 qty = min(qty, max(0, max_buy))
                 if qty <= 0:
                     return 0.0
                 self.positions[product] += qty
                 self.entry_values[product] += qty * price
-                return 0.0  # no immediate PnL on market orders
+                return 0.0
             else:
                 price = best_bid
                 max_sell = pos_limit + self.positions[product]
@@ -290,10 +291,9 @@ class TradingEnv(gym.Env):
                 return 0.0
 
         elif params["type"] == "passive":
-            # Limit order: sits at best bid/ask (or deeper)
-            # Simplified fill model: assume 50% fill probability for passive orders
+            # Limit order with simplified fill model
             offset = params.get("offset", 0)
-            fill_prob = 0.5 if offset == 0 else 0.3  # deeper = less likely to fill
+            fill_prob = 0.5 if offset == 0 else 0.3
 
             if self.rng.random() > fill_prob:
                 return 0.0  # not filled
